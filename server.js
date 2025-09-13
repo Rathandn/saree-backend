@@ -56,7 +56,7 @@ async function listFiles(folderId) {
     range: "1-2k",
     price: "₹1500",
     // ✅ Serve via backend
-    image: `http://localhost:5000/api/image/${f.id}`,
+    image: `https://saree-backend-j7zj.onrender.com/api/image/${f.id}`,
   }));
 }
 
