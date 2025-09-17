@@ -1,5 +1,6 @@
 // backend/server.js
-require('dotenv').config();
+require("dotenv").config();
+const Redis = require("ioredis");
 const express = require("express");
 const { google } = require("googleapis");
 const path = require("path");
@@ -9,14 +10,18 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ✅ Connect to Upstash Redis
+const redis = new Redis(process.env.UPSTASH_REDIS_REST_URL);
+
+// Google Drive setup
 const KEYFILEPATH = path.join(__dirname, "service-account.json");
 const SCOPES = ["https://www.googleapis.com/auth/drive.readonly"];
 
 const auth = new google.auth.GoogleAuth({
-   credentials: {
+  credentials: {
     type: process.env.GOOGLE_TYPE,
     project_id: process.env.GOOGLE_PROJECT_ID,
-    private_key_id:process.env.GOOGLE_PRIVATE_KEY_ID,
+    private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
     private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
     client_email: process.env.GOOGLE_CLIENT_EMAIL,
     client_id: process.env.GOOGLE_CLIENT_ID,
@@ -24,7 +29,7 @@ const auth = new google.auth.GoogleAuth({
     token_uri: process.env.GOOGLE_TOKEN_URI,
     auth_provider_x509_cert_url: process.env.GOOGLE_AUTH_PROVIDER_CERT_URL,
     client_x509_cert_url: process.env.GOOGLE_CLIENT_CERT_URL,
-    universe_domain:process.env.GOOGLE_UNIVERSE_DOMAIN
+    universe_domain: process.env.GOOGLE_UNIVERSE_DOMAIN,
   },
   scopes: SCOPES,
 });
@@ -34,7 +39,7 @@ const drive = google.drive({ version: "v3", auth });
 // Root folder
 const ROOT_FOLDER_ID = "1D5KfQhDqL0gz3ymI1QWrVyzu_uwe385_";
 
-// List folders
+// Helper: List folders
 async function listFolders(parentId) {
   const res = await drive.files.list({
     q: `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
@@ -43,7 +48,7 @@ async function listFolders(parentId) {
   return res.data.files;
 }
 
-// List files inside a folder
+// Helper: List files inside a folder
 async function listFiles(folderId) {
   const res = await drive.files.list({
     q: `'${folderId}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false`,
@@ -55,25 +60,33 @@ async function listFiles(folderId) {
     category: "Default",
     range: "1-2k",
     price: "₹1500",
-    // ✅ Serve via backend
-    image: `https://saree-backend-j7zj.onrender.com/api/image/${f.id}`,
+    image: `https://saree-backend-j7zj.onrender.com/api/image/${f.id}`, // served via backend
   }));
 }
 
-// API: stream image
+// API: stream image (cache metadata in Redis)
 app.get("/api/image/:id", async (req, res) => {
   try {
     const fileId = req.params.id;
 
-    // Get metadata
-    const meta = await drive.files.get({
-      fileId,
-      fields: "mimeType, name",
-    });
+    // ✅ Try cache first (metadata)
+    const cachedMeta = await redis.get(`image_meta:${fileId}`);
+    let mimeType;
 
-    const mimeType = meta.data.mimeType || "application/octet-stream";
+    if (cachedMeta) {
+      mimeType = cachedMeta;
+      console.log(`✅ Cache hit for image meta ${fileId}`);
+    } else {
+      console.log(`❌ Cache miss for image meta ${fileId}`);
+      const meta = await drive.files.get({
+        fileId,
+        fields: "mimeType, name",
+      });
+      mimeType = meta.data.mimeType || "application/octet-stream";
+      await redis.set(`image_meta:${fileId}`, mimeType, "EX", 3600); // cache 1h
+    }
 
-    // Get stream
+    // Get image stream
     const response = await drive.files.get(
       { fileId, alt: "media" },
       { responseType: "stream" }
@@ -87,9 +100,19 @@ app.get("/api/image/:id", async (req, res) => {
   }
 });
 
-// API: Get full catalog
+// API: Get full catalog (with Redis caching)
 app.get("/api/catalog", async (req, res) => {
   try {
+    // ✅ Check Redis first
+    const cached = await redis.get("saree_catalog");
+    if (cached) {
+      console.log("✅ Cache hit for catalog");
+      return res.json(JSON.parse(cached));
+    }
+
+    console.log("❌ Cache miss - fetching from Google Drive");
+
+    // Fetch from Google Drive
     const categories = await listFolders(ROOT_FOLDER_ID);
 
     const catalog = [];
@@ -115,6 +138,9 @@ app.get("/api/catalog", async (req, res) => {
       });
     }
 
+    // ✅ Save to Redis (cache for 10 minutes)
+    await redis.set("saree_catalog", JSON.stringify(catalog), "EX", 600);
+
     res.json(catalog);
   } catch (err) {
     console.error(err);
@@ -122,7 +148,8 @@ app.get("/api/catalog", async (req, res) => {
   }
 });
 
-const PORT = 5000;
+// Start server
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () =>
   console.log(`✅ Backend running on http://localhost:${PORT}`)
 );
