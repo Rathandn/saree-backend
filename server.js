@@ -1,6 +1,6 @@
 // backend/server.js
 require("dotenv").config();
-const Redis = require("ioredis");
+const { Redis } = require("@upstash/redis");
 const express = require("express");
 const { google } = require("googleapis");
 const path = require("path");
@@ -10,13 +10,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ Connect to Upstash Redis
-const redis = new Redis(process.env.UPSTASH_REDIS_REST_URL);
+// ✅ Connect to Upstash Redis (REST API)
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
-// Google Drive setup
-const KEYFILEPATH = path.join(__dirname, "service-account.json");
+// ✅ Google Drive setup
 const SCOPES = ["https://www.googleapis.com/auth/drive.readonly"];
-
 const auth = new google.auth.GoogleAuth({
   credentials: {
     type: process.env.GOOGLE_TYPE,
@@ -39,7 +40,7 @@ const drive = google.drive({ version: "v3", auth });
 // Root folder
 const ROOT_FOLDER_ID = "1D5KfQhDqL0gz3ymI1QWrVyzu_uwe385_";
 
-// Helper: List folders
+// ------------------ Helpers ------------------
 async function listFolders(parentId) {
   const res = await drive.files.list({
     q: `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
@@ -48,7 +49,6 @@ async function listFolders(parentId) {
   return res.data.files;
 }
 
-// Helper: List files inside a folder
 async function listFiles(folderId) {
   const res = await drive.files.list({
     q: `'${folderId}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false`,
@@ -64,29 +64,31 @@ async function listFiles(folderId) {
   }));
 }
 
-// API: stream image (cache metadata in Redis)
+// ------------------ APIs ------------------
+
+// ✅ Stream image (cache mimeType in Redis)
 app.get("/api/image/:id", async (req, res) => {
   try {
     const fileId = req.params.id;
 
-    // ✅ Try cache first (metadata)
-    const cachedMeta = await redis.get(`image_meta:${fileId}`);
-    let mimeType;
+    // Check Redis for mimeType
+    let mimeType = await redis.get(`image_meta:${fileId}`);
 
-    if (cachedMeta) {
-      mimeType = cachedMeta;
-      console.log(`✅ Cache hit for image meta ${fileId}`);
+    if (mimeType) {
+      console.log(`📦 Cache hit for image meta ${fileId}`);
     } else {
-      console.log(`❌ Cache miss for image meta ${fileId}`);
+      console.log(`⚡ Fetching Google Drive meta for ${fileId}`);
       const meta = await drive.files.get({
         fileId,
         fields: "mimeType, name",
       });
       mimeType = meta.data.mimeType || "application/octet-stream";
-      await redis.set(`image_meta:${fileId}`, mimeType, "EX", 3600); // cache 1h
+
+      // Cache mimeType for 1h
+      await redis.set(`image_meta:${fileId}`, mimeType, { ex: 3600 });
     }
 
-    // Get image stream
+    // Fetch image stream
     const response = await drive.files.get(
       { fileId, alt: "media" },
       { responseType: "stream" }
@@ -95,24 +97,26 @@ app.get("/api/image/:id", async (req, res) => {
     res.setHeader("Content-Type", mimeType);
     response.data.pipe(res);
   } catch (err) {
-    console.error("Error fetching image:", err.message);
+    console.error("❌ Error fetching image:", err.message);
     res.status(500).send("Error fetching image");
   }
 });
 
-// API: Get full catalog (with Redis caching)
+// ✅ Get full catalog (with Redis caching)
 app.get("/api/catalog", async (req, res) => {
   try {
-    // ✅ Check Redis first
-    const cached = await redis.get("saree_catalog");
+    const cacheKey = "saree_catalog";
+
+    // Check Redis first
+    const cached = await redis.get(cacheKey);
     if (cached) {
-      console.log("✅ Cache hit for catalog");
-      return res.json(JSON.parse(cached));
+      console.log("📦 Cache hit for catalog");
+      return res.json(cached); // Upstash auto-parses JSON
     }
 
-    console.log("❌ Cache miss - fetching from Google Drive");
+    console.log("⚡ Cache miss - fetching from Google Drive");
 
-    // Fetch from Google Drive
+    // Fetch categories and subfolders
     const categories = await listFolders(ROOT_FOLDER_ID);
 
     const catalog = [];
@@ -138,17 +142,17 @@ app.get("/api/catalog", async (req, res) => {
       });
     }
 
-    // ✅ Save to Redis (cache for 10 minutes)
-    await redis.set("saree_catalog", JSON.stringify(catalog), "EX", 600);
+    // Save in Redis (cache for 10 min)
+    await redis.set(cacheKey, catalog, { ex: 600 });
 
     res.json(catalog);
   } catch (err) {
-    console.error(err);
+    console.error("❌ Error fetching catalog:", err.message);
     res.status(500).send("Error fetching catalog");
   }
 });
 
-// Start server
+// ------------------ Start Server ------------------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () =>
   console.log(`✅ Backend running on http://localhost:${PORT}`)
